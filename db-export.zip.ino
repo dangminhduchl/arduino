@@ -1,26 +1,26 @@
 #include <ESP8266WiFi.h>
-#include <PubSubClient.h>
 #include <Redis.h>
 
-WiFiClient espClient;
-WiFiClient redisConn;
+#define MAX_BACKOFF 300000
 
-Redis *gRedis = nullptr;
-PubSubClient client(espClient);
+
+WiFiClient espClient;
+WiFiClient pubSubWiFiClient;
+Redis redis(espClient);
+Redis pub_redis(pubSubWiFiClient);
 
 const char* ssid = "Duc";
 const char* password = "1234567789";
-const char* mqttServer = "54.252.131.125";
-const int mqttPort = 1883;
-const char* mqttClientID = "mqttClient";
+const char* redisServer = "3.27.65.231";
+const int redisPort = 6379;
 
-const int magnet_switch = 5; // Magnet switch
+const int magnet_switch = 5;  // Magnet switch
 const int magnetLED = 14;
 const int lock = 4;
 
 long currentTime = 0;
-int door_status = null;
-int lock_status = null;
+int door_status = 0;
+int lock_status = 0;
 
 void setup() {
   Serial.begin(19200);
@@ -29,109 +29,111 @@ void setup() {
   pinMode(lock, OUTPUT);
   digitalWrite(magnetLED, LOW);
   digitalWrite(lock, LOW);
-  
+
+  setupWiFi();
+  setupRedis();
+
+  // Set initial lock and door status in Redis
+  redis.set("status:lock", String(lock_status).c_str());
+  redis.set("status:door", String(door_status).c_str());
+
+  auto backoffCounter = -1;
+  auto resetBackoffCounter = [&]() {
+    backoffCounter = 0;
+  };
+
+  while (subscribeLoop(resetBackoffCounter)) {
+    auto curDelay = min((1000 * (int)pow(2, backoffCounter)), MAX_BACKOFF);
+
+    if (curDelay != MAX_BACKOFF) {
+      ++backoffCounter;
+    }
+
+    Serial.printf("Waiting %ds to reconnect...\n", curDelay / 1000);
+    delay(curDelay);
+  }
+}
+
+bool subscribeLoop(std::function<void(void)> resetCounter) {
+  Serial.println("Listening...");
+  resetCounter();
+  pub_redis.subscribe("control");
+  auto subRv = pub_redis.startSubscribingNonBlocking(redisSubCallback, loop);
+  return subRv == RedisSubscribeServerDisconnected;
+}
+
+void setupWiFi() {
   Serial.print("Connecting to ");
   Serial.println(ssid);
   WiFi.begin(ssid, password);
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  
+
+
   Serial.println("");
   Serial.println("WiFi connected.");
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
-  
-  client.setServer(mqttServer, mqttPort);
-  client.setCallback(callback);
-  String publishpayload = "{\"lock\" : 0, \"door\" : 0}";
-  client.publish("status",(const uint8_t*)publishpayload.c_str(), publishpayload.length(), false);
-  if (!redisConn.connect("127.0.0.1", "6379")) {
-    return;
-  }
-
-  gRedis = Redis(redisConn);
-  
-
-
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.println("Connecting to MQTT broker...");
-    if (client.connect(mqttClientID)) {
-      Serial.println("Connected to MQTT broker");
-      // Subscribe to the control topic
-      client.subscribe("control");
-    } else {
-      Serial.print("Failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" Retrying in 5 seconds...");
-      delay(5000);
-    }
+void setupRedis() {
+  espClient.connect(redisServer, redisPort);
+  if (espClient.connected()) {
+    Serial.print("connected redis");
+  }
+
+  pubSubWiFiClient.connect(redisServer, redisPort);
+  if (pubSubWiFiClient.connected()) {
+    Serial.print("connected redis");
   }
 }
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Received message on topic: ");
-  Serial.println(topic);
-  Serial.print("Message: ");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
-  }
-  Serial.println();
-
-  // Handle control commands
-  if (strcmp(topic, "control") == 0) {
-    Serial.println("Received message from control topic");
-    
-    // Create a char array to store the message
-    char message[length + 1]; // +1 for null-terminator
-    strncpy(message, (char*)payload, length); // Copy payload to message array
-    message[length] = '\0'; // Add null-terminator at the end
-    
-    String receivedMessage = String(message);
-    Serial.println("MESSAGE:\n");
-    Serial.println(receivedMessage);
-    Serial.println("end:\n");
-    
-    if (receivedMessage == "1") {
-      lock_status = 1;
-      digitalWrite(lock, HIGH);
-      Serial.println("Lock engaged");
-    } else if (receivedMessage == "0") {
-      lock_status = 0;
+void redisSubCallback(Redis* redisInstance, String channel, String msg) {
+  Serial.println(channel);
+  Serial.println(msg);
+  if (channel == "control") {
+    if (msg == "0")
+    {
       digitalWrite(lock, LOW);
-      Serial.println("Lock disengaged");
     }
+    if (msg == "1")
+    {
+      digitalWrite(lock, HIGH);
+    }
+
   }
 }
 
 
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
-  
-  client.loop();
-  
   currentTime = millis();
-  if (door_status == null && lock_status == null) {
-
+  if (!espClient.connected()) {
+    Serial.println("Failed to connect to Redis server");
+    espClient.connect(redisServer, redisPort);
   }
-  
-  int new_door_status = digitalRead(magnet_switch);
+  //
+  int new_door_status = !digitalRead(magnet_switch);
   int new_lock_status = digitalRead(lock);
-  
-  // Publish the lock and door status to the MQTT server
+
   if (new_door_status != door_status || new_lock_status != lock_status) {
     door_status = new_door_status;
     lock_status = new_lock_status;
-    String publishpayload = "{ \"lock\": " + String(lock_status) + ", \"door\": " + String(door_status) + " }";
-    client.publish("status",(const uint8_t*)publishpayload.c_str(), publishpayload.length(), false);
+    Serial.printf("lock data: %d\n", lock_status);
+    String publishPayload = "{\"lock\": " + String(lock_status) + ", \"door\": " + String(new_door_status) + "}";
+    Serial.println(publishPayload);
+    // Publish message vào "status" trong Redis
+    // const char* dit ="DITME";
+    // const char* key = "status";
+    if (redis.set("status", publishPayload.c_str())) {
+      Serial.println("Success");
+    } else {
+      Serial.println("Failed");
+    }
   }
 
-  digitalWrite(magnetLED, HIGH);
+  // digitalWrite(magnetLED, LOW);
   delay(1000);
 }
