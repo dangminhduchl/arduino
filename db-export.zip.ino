@@ -6,6 +6,7 @@
 
 WiFiClient espClient;
 WiFiClient pubSubWiFiClient;
+
 Redis redis(espClient);
 Redis pub_redis(pubSubWiFiClient);
 
